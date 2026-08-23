@@ -1,186 +1,132 @@
+import os
 import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from src.cold_start import (
-    ColdStartRecommender
-)
-
-from src.explainability import (
-    RecommendationExplainer
-)
-
-from src.matrix_factorization import (
-    MatrixFactorizationALS
-)
-
+from src.cold_start import ColdStartRecommender
+from src.data_loader import MovieLensLoader
+from src.matrix_factorization import MatrixFactorizationALS
 
 st.set_page_config(
-    page_title=
-    "MovieLens Recommender — Matrix Factorization",
-    layout="wide"
+    page_title="MovieLens Recommender — Matrix Factorization",
+    layout="wide",
 )
+
+MODEL_DIR = "models"
+REQUIRED_MODEL_FILES = [
+    "U.npy",
+    "V.npy",
+    "user_bias.npy",
+    "item_bias.npy",
+    "global_mean.npy",
+]
+
+
+def model_files_available():
+    return all(
+        os.path.exists(os.path.join(MODEL_DIR, name))
+        for name in REQUIRED_MODEL_FILES
+    )
+
+
+@st.cache_data(show_spinner="Preparing MovieLens data...")
+def load_data():
+    loader = MovieLensLoader()
+    loader.download()
+
+    ratings = loader.load_ratings()
+    movies = loader.load_movies()
+    train_df, _ = loader.train_test_split(ratings)
+
+    return train_df, movies
 
 
 @st.cache_resource
 def load_model():
+    if not model_files_available():
+        return None
 
     model = MatrixFactorizationALS()
-
-    model.U = np.load(
-        "models/U.npy"
-    )
-
-    model.V = np.load(
-        "models/V.npy"
-    )
-
+    model.U = np.load(os.path.join(MODEL_DIR, "U.npy"))
+    model.V = np.load(os.path.join(MODEL_DIR, "V.npy"))
     model.bias_model.user_bias = np.load(
-        "models/user_bias.npy"
+        os.path.join(MODEL_DIR, "user_bias.npy")
     )
-
     model.bias_model.item_bias = np.load(
-        "models/item_bias.npy"
+        os.path.join(MODEL_DIR, "item_bias.npy")
     )
-
     model.bias_model.global_mean = np.load(
-        "models/global_mean.npy"
+        os.path.join(MODEL_DIR, "global_mean.npy")
     )[0]
 
     return model
 
 
-@st.cache_data
-def load_data():
-
-    train_df = pd.read_csv(
-        "models/train.csv"
-    )
-
-    movies = pd.read_csv(
-        "models/movies.csv"
-    )
-
-    return train_df, movies
-
-
+train_df, movies = load_data()
 model = load_model()
 
-train_df, movies = load_data()
-
-st.title(
-    "MovieLens Recommender — Matrix Factorization"
+st.title("MovieLens Recommender")
+st.caption(
+    "Movie recommendations using ALS matrix factorization when trained "
+    "artifacts are available, with a cold-start recommender fallback."
 )
 
-st.sidebar.header(
-    "Controls"
-)
-
-new_user = st.sidebar.checkbox(
-    "I'm a new user"
-)
-
-if not new_user:
-
-    user_id = st.sidebar.slider(
-        "User ID",
-        1,
-        6040,
-        1
+if model is None:
+    st.info(
+        "Trained ALS artifacts are not included in this deployment, so the "
+        "app is running in cold-start mode using MovieLens ratings and genres."
     )
 
+st.sidebar.header("Controls")
+new_user = st.sidebar.checkbox("I'm a new user", value=True)
+
+if model is not None and not new_user:
+    max_user = min(len(model.U), 6040)
+    user_id = st.sidebar.slider("User ID", 1, max_user, 1)
 else:
-
+    new_user = True
     genres = sorted(
-        list(
-            {
-                g
-                for row in movies.genres
-                for g in row.split("|")
-            }
-        )
+        {
+            genre
+            for row in movies["genres"].dropna()
+            for genre in row.split("|")
+        }
     )
+    selected = st.sidebar.multiselect("Favorite Genres", genres)
 
-    selected = st.sidebar.multiselect(
-        "Favorite Genres",
-        genres
-    )
-
-if st.sidebar.button(
-    "Get Recommendations"
-):
-
-    if not new_user:
-
+if st.sidebar.button("Get Recommendations"):
+    if not new_user and model is not None:
+        loader = MovieLensLoader()
+        train_matrix = loader.build_sparse_matrix(train_df)
         user_idx = user_id - 1
+        recs = model.recommend(user_idx, top_k=10, R=train_matrix)
 
-        recs = model.recommend(
-            user_idx,
-            top_k=10,
-            R=None
-        )
-
-        st.subheader(
-            f"Top Recommendations for User #{user_id}"
-        )
-
+        st.subheader(f"Top Recommendations for User #{user_id}")
         for movie_idx in recs:
-
             movie_id = movie_idx + 1
-
-            movie = movies[
-                movies.movieId == movie_id
-            ]
-
-            if len(movie) == 0:
+            match = movies[movies.movieId == movie_id]
+            if match.empty:
                 continue
 
-            movie = movie.iloc[0]
-
-            rating = model.predict(
-                user_idx,
-                movie_idx
-            )
-
-            stars = (
-                "★" *
-                round(rating)
-            )
-
+            movie = match.iloc[0]
+            rating = model.predict(user_idx, movie_idx)
+            stars = "★" * max(1, round(rating))
             st.markdown(
-                f"""
-                ### {movie.title}
-                Genres: {movie.genres}
-
-                Rating:
-                {stars} ({rating:.2f}/5)
-                """
+                f"### {movie.title}\n"
+                f"**Genres:** {movie.genres}\n\n"
+                f"**Predicted rating:** {stars} ({rating:.2f}/5)"
             )
-
     else:
-
         cold = ColdStartRecommender()
+        cold.fit(movies, train_df)
 
-        cold.fit(
-            movies,
-            train_df
-        )
-
-        recs = cold.recommend(
-            selected,
-            top_k=10
-        )
-
-        st.subheader(
-            "Recommendations"
-        )
-
-        st.dataframe(
-            recs[
-                [
-                    "title",
-                    "genres",
-                    "avg_rating"
-                ]
-            ]
-      )
+        if not selected:
+            st.warning("Select at least one favorite genre.")
+        else:
+            recs = cold.recommend(selected, top_k=10)
+            st.subheader("Recommendations")
+            st.dataframe(
+                recs[["title", "genres", "avg_rating", "rating_count"]],
+                use_container_width=True,
+                hide_index=True,
+            )
